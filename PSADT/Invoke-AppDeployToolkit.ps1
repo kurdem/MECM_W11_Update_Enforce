@@ -25,6 +25,7 @@ Exit Codes (in MECM unter "Return Codes" pflegen):
   69002  Vorpruefung fehlgeschlagen (Failure)
   69003  Installation fehlgeschlagen (Failure)
   69004  PSWindowsUpdate konnte nicht geladen werden (Failure)
+  69005  Scan/Download fehlgeschlagen, meist Proxy/Netzwerk (Failure)
   69010  Uninstall nicht unterstuetzt (Failure)
   60001  Unbehandelter Fehler (PSADT Standard)
 
@@ -96,17 +97,17 @@ $adtSession = @{
 
 $script:CUConfig = @{
     # Quelle fuer den Scan:
-    #   'MicrosoftUpdate' = online gegen Microsoft Update (umgeht WSUS/SUP auf API-Ebene)
-    #   'WindowsUpdate'   = online gegen Windows Update
-    #   'Default'         = konfigurierte Quelle des Clients (bei MECM: SUP/WSUS)
+    #   'WindowsUpdate'   = online gegen Windows Update, an SUP/WSUS vorbei (empfohlen bei SUP)
+    #   'MicrosoftUpdate' = online gegen Microsoft Update (registriert ggf. den MU-Dienst auf dem Client)
+    #   'Default'         = konfigurierte Quelle des Clients (bei MECM: SUP/WSUS -> Download scheitert i.d.R.)
     # Siehe README, Abschnitt "Update-Quelle".
-    UpdateSource          = 'MicrosoftUpdate'
+    UpdateSource          = 'WindowsUpdate'
 
     # Optional: feste KB(s) erzwingen, z.B. @('KB5070000'). Leer = Titel-Filter (Evergreen).
     KBArticleID           = @()
 
-    # Titel-Filter (Regex). Vor Produktivnahme auf einem Testclient mit
-    #   Get-WindowsUpdate -MicrosoftUpdate | Select-Object KB, Title
+    # Titel-Filter (Regex). Vor Produktivnahme auf einem Testclient (als SYSTEM) mit
+    #   Get-WindowsUpdate -WindowsUpdate | Select-Object KB, Title
     # gegen die aktuell gelieferten Titel pruefen.
     TitleInclude          = 'Cumulative Update.*Windows 11|Windows 11.*Cumulative Update'
     TitleExclude          = '\.NET|Preview|Dynamic'
@@ -157,6 +158,21 @@ function Test-CUPrerequisite
     {
         Write-ADTLogEntry -Message 'Geraet laeuft im Akkubetrieb.' -Severity 3
         return $false
+    }
+
+    if ($script:CUConfig.UpdateSource -ne 'Default')
+    {
+        # GPO "Keine Verbindungen mit Windows Update-Internetadressen herstellen" blockiert den Online-Scan.
+        $wuPol = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue
+        if ($wuPol -and $wuPol.PSObject.Properties['DoNotConnectToWindowsUpdateInternetLocations'] -and $wuPol.DoNotConnectToWindowsUpdateInternetLocations -eq 1)
+        {
+            Write-ADTLogEntry -Message 'GPO DoNotConnectToWindowsUpdateInternetLocations=1 aktiv. Online-Scan nicht moeglich.' -Severity 3
+            return $false
+        }
+
+        # WUA nutzt im SYSTEM-Kontext den WinHTTP-Proxy, nicht den Benutzer-Proxy (PAC/WinINET).
+        $winhttp = (& "$env:SystemRoot\System32\netsh.exe" winhttp show proxy 2>&1 | Out-String).Trim()
+        Write-ADTLogEntry -Message "WinHTTP-Proxy (SYSTEM):`n$winhttp"
     }
 
     return $true
@@ -286,7 +302,18 @@ function Install-ADTDeployment
         return
     }
 
-    $updates = Find-CUUpdate
+    try
+    {
+        $updates = Find-CUUpdate
+    }
+    catch
+    {
+        # Typisch: 0x80072EE2 (Timeout), 0x80072EFD (keine Verbindung), 0x80244022/0x80190197 (Proxy/407)
+        Write-ADTLogEntry -Message "Update-Scan fehlgeschlagen: $(Resolve-ADTErrorRecord -ErrorRecord $_)" -Severity 3
+        $script:CUExitCode = 69005
+        return
+    }
+
     if ($updates.Count -eq 0)
     {
         Write-ADTLogEntry -Message 'Kein passendes kumulatives Update angeboten.' -Severity 3
@@ -294,7 +321,16 @@ function Install-ADTDeployment
         return
     }
 
-    $ok = Install-CUUpdate -KB ([string[]]($updates.KB))
+    try
+    {
+        $ok = Install-CUUpdate -KB ([string[]]($updates.KB))
+    }
+    catch
+    {
+        Write-ADTLogEntry -Message "Download/Installation fehlgeschlagen: $(Resolve-ADTErrorRecord -ErrorRecord $_)" -Severity 3
+        $script:CUExitCode = 69005
+        return
+    }
     if (-not $ok)
     {
         $script:CUExitCode = 69003

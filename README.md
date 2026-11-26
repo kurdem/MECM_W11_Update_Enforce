@@ -34,20 +34,33 @@ Vor der Produktivnahme auf einem Testclient (als SYSTEM, z. B. `psexec -s`) die 
 
 ```powershell
 Import-Module .\SupportFiles\Modules\PSWindowsUpdate\<version>\PSWindowsUpdate.psd1
-Get-WindowsUpdate -MicrosoftUpdate | Select-Object KB, Title
+Get-WindowsUpdate -WindowsUpdate | Select-Object KB, Title
 ```
 
-## Update-Quelle (wichtig, bitte prüfen)
+## Update-Quelle (Umgebung: SUP/WSUS, Internet über Proxy)
 
-Parameter `UpdateSource` im Skript:
+Parameter `UpdateSource` im Skript, Standard **`WindowsUpdate`**:
 
-| Wert | Verhalten | Voraussetzung |
-|---|---|---|
-| `MicrosoftUpdate` (Standard) | Scan und Download direkt bei Microsoft Update, an SUP/WSUS vorbei | Internetzugriff für SYSTEM (WinHTTP-Proxy), GPO *„Keine Verbindungen mit Windows Update-Internetadressen herstellen“* **nicht** aktiv |
-| `WindowsUpdate` | wie oben, nur Windows-Produkte | wie oben |
-| `Default` | konfigurierte Quelle des Clients (bei MECM: SUP/WSUS) | Der Download funktioniert nur, wenn WSUS die Dateien vorhält oder der Client sie von MU laden darf. Beim Standard-SUP-Setup scheitert das in der Regel. |
+| Wert | Verhalten |
+|---|---|
+| `WindowsUpdate` (Standard) | Scan und Download direkt bei Windows Update, an SUP/WSUS vorbei. Die WSUS-Konfiguration des Clients bleibt unverändert. |
+| `MicrosoftUpdate` | wie oben, inkl. anderer MS-Produkte; registriert ggf. den Microsoft-Update-Dienst auf dem Client. Für das LCU nicht nötig. |
+| `Default` | Quelle des Clients = SUP/WSUS. WSUS hält beim SUP-Setup keine Dateien vor, daher scheitert der Download. Nicht verwenden. |
 
-Delivery Optimization reduziert bei `MicrosoftUpdate` die WAN-Last.
+Voraussetzungen für `WindowsUpdate` mit Proxy:
+
+1. **WinHTTP-Proxy für SYSTEM.** Der Windows Update Agent läuft als SYSTEM und nutzt den WinHTTP-Proxy, nicht den Benutzer-Proxy/PAC aus dem Browser. Prüfen als SYSTEM:
+   ```powershell
+   netsh winhttp show proxy
+   ```
+   Ist dort „Direkter Zugriff“ eingetragen und es gibt keinen direkten Weg ins Internet, per GPO/Skript setzen (`netsh winhttp set proxy <proxy>:<port> "<local>;*.contoso.local"`). Das Skript schreibt den Wert ins PSADT-Log, ändert ihn aber nicht.
+2. **Proxy-Authentifizierung:** SYSTEM meldet sich als Computerkonto an. Die Windows-Update-URLs müssen ohne Benutzer-Authentifizierung erreichbar sein (Ausnahme/Allowlist). Siehe Microsoft-Doku „Windows Update endpoints“ / „Manage connection endpoints for Windows 11“.
+3. **GPO** *„Keine Verbindungen mit Windows Update-Internetadressen herstellen“* (`DoNotConnectToWindowsUpdateInternetLocations`) darf **nicht** aktiv sein. Das Skript prüft das und endet sonst mit 69002.
+4. **Bandbreite:** Jeder Client lädt das LCU aus dem Internet. Delivery Optimization (Peer-Caching im LAN) reduziert die Last. Die Ringe begrenzen die gleichzeitigen Downloads.
+
+Proxy-/Netzwerkfehler beim Scan oder Download enden mit **69005**. Den genauen Fehlercode zeigt das PSADT-Log (z. B. `0x80072EE2` Timeout, `0x80072EFD` keine Verbindung, `0x80190197` Proxy-Auth 407).
+
+**Zusammenspiel mit SUP:** Der Software-Update-Scan von MECM läuft weiter gegen den SUP. Nach dem Neustart meldet der nächste Scan das LCU als installiert, sodass Compliance-Berichte stimmig bleiben.
 
 ## MECM Application – Einstellungen
 
@@ -78,6 +91,7 @@ Delivery Optimization reduziert bei `MicrosoftUpdate` die WAN-Last.
 | 69002 | Fehler | Vorprüfung fehlgeschlagen (OS/Speicher/Akku) |
 | 69003 | Fehler | Installation fehlgeschlagen |
 | 69004 | Fehler | PSWindowsUpdate fehlt im Content |
+| 69005 | Fehler | Scan/Download fehlgeschlagen (meist Proxy/Netzwerk) |
 | 60001 | Fehler | unbehandelter Fehler (PSADT) |
 
 > Hinweis zu 1602: Als *Fast Retry* zeigt MECM das Deployment ständig als „in Bearbeitung“, und der Client fragt alle 2 Stunden erneut nach. Als *Fehler* fragt der Client beim nächsten Deployment Evaluation Cycle erneut nach. Das ist eine Geschmacksfrage.
