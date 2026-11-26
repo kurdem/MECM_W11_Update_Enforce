@@ -9,7 +9,10 @@ MECM-Application, die per **PSAppDeployToolkit 4.1.x** und **PSWindowsUpdate** d
 | `PSADT/Invoke-AppDeployToolkit.ps1` | Vorprüfungen, Benutzerdialog/Deferral, Scan + Installation über PSWindowsUpdate, Exit 3010 |
 | `Detection/Detect-W11CU.ps1` | Script Detection: `CurrentBuildNumber` + `UBR` ≥ Ziel-UBR |
 | `Tools/New-CUPackage.ps1` | Baut den Content (PSADT-Template + Skript + PSWindowsUpdate in `SupportFiles\Modules`) |
-| `Tools/Set-CMCUDetection.ps1` | Monatlich: Ziel-UBR in der Detection des Deployment Types setzen |
+| `Tools/New-CMCUApplication.ps1` | Einmalig: Application, Deployment Type, Return Codes, Requirements, Content-Verteilung, Ring-Sammlungen anlegen |
+| `Tools/Start-CMCURollout.ps1` | Monatlich: Deployments entfernen, Ziel-UBR setzen, Ring-Deployments mit neuen Terminen anlegen |
+| `Tools/Set-CMCUDetection.ps1` | Nur Ziel-UBR setzen (ohne Deployments neu anzulegen) |
+| `Tools/CMCU.Common.ps1` | Gemeinsame Funktionen der MECM-Skripte |
 
 **Evergreen-Prinzip:** Der Content bleibt gleich. Das Skript installiert immer das LCU, das der Client angeboten bekommt. Welcher Stand als „erfüllt“ gilt, steuert nur die Detection (Ziel-UBR). Monatlich wird nur die Detection angepasst, nicht der Content.
 
@@ -98,45 +101,62 @@ Proxy-/Netzwerkfehler beim Scan oder Download enden mit **69005**. Den genauen F
 
 ## Deployment-Vorschlag
 
-### Zielsammlungen
+### Einmalig: Application und Sammlungen anlegen
 
-Geräte-Sammlungen per Query auf den Build. Builds, die in der Detection nicht gepflegt sind, gelten absichtlich als „installiert“ (fail-safe).
+Voraussetzungen: MECM-Konsole, ConfigMgr 2107 oder neuer, Konsolensprache Englisch (Namen der Global Conditions).
 
-```sql
-select SMS_R_System.ResourceId from SMS_R_System
-where SMS_R_System.Build01 in ('10.0.26100','10.0.26200')
+```powershell
+.\Tools\New-CMCUApplication.ps1 -SiteCode P01 -ProviderMachineName cm01.contoso.local `
+    -ContentLocation '\\cm01\Sources$\Apps\Microsoft\W11-CU' -DistributionPointGroupName '<DP-Gruppe>' -WhatIf
 ```
 
-### Ringe (Phased Deployment oder manuell)
+Erst mit `-WhatIf` prüfen, dann ohne ausführen. Das Skript ist idempotent: Vorhandene Objekte werden übersprungen, nicht geändert.
 
-| Ring | Sammlung | Verfügbar | Deadline | Benutzererlebnis |
-|---|---|---|---|---|
-| 0 – IT | IT-Geräte | Patchday +1 | Patchday +1 | interaktiv, Deferral 3x |
-| 1 – Pilot | ca. 5–10 % repräsentative Geräte | +2 Tage | +4 Tage | interaktiv, Deferral 3x |
-| 2 – Breit | alle Clients | +7 Tage | +10 Tage | interaktiv, Deferral 3x |
-| 3 – Kritisch/Kiosk | Sondersysteme | +10 Tage | im Wartungsfenster | `-DeployMode NonInteractive` (eigener Deployment Type oder eigene App) |
+Angelegt werden:
+- Application `Windows 11 Cumulative Update`, Deployment Type `PSADT` mit allen Einstellungen aus dem Abschnitt oben
+- Return Codes 1602, 69001–69005, 69010, 60001, 60008 (die Standardcodes legt MECM selbst an)
+- Requirements: Plattform `All Windows 11 (64-bit)` und mindestens 15 GB frei auf dem Systemlaufwerk. Weicht der Plattformname bei euch ab, listet das Skript die verfügbaren Namen.
+- Sammlungen:
 
-Für Ring 0–2 bietet sich das MECM-Feature **Phased Deployment** für Applications an (Erfolgskriterium z. B. 95 %, dann automatisch nächste Phase).
+| Sammlung | Mitglieder |
+|---|---|
+| `W11-CU \| Basis` | Query: Workstations mit Build `10.0.26100` / `10.0.26200` |
+| `W11-CU \| Ring 0 - IT` | manuell pflegen, begrenzt auf Basis |
+| `W11-CU \| Ring 1 - Pilot` | manuell pflegen (5–10 %), begrenzt auf Basis |
+| `W11-CU \| Ring 3 - Kritisch` | manuell pflegen, begrenzt auf Basis |
+| `W11-CU \| Ring 2 - Breit` | Include Basis, Exclude Ring 0/1/3 |
 
-### Deployment-Einstellungen
+Builds, die in der Detection nicht gepflegt sind, gelten absichtlich als „installiert“ (fail-safe).
 
-- Zweck: **Erforderlich**, Aktion: Installieren
-- Benutzerbenachrichtigung: *Im Softwarecenter anzeigen und alle Benachrichtigungen anzeigen*
-- Wartungsfenster: Softwareinstallation **und** Systemneustart außerhalb des Wartungsfensters erlauben, wenn die Deadline durchgesetzt werden soll. Sonst bleibt es beim Wartungsfenster.
-- Neustart-Countdown über die **Client Settings** → *Computer Restart* (z. B. 8 h Countdown, 15 Min. finale Warnung)
-- Optional: *Automatically upgrade/Re-Enforce* ist nicht nötig. Nach geänderter Detection wertet der Client beim nächsten Application Deployment Evaluation Cycle neu aus. Der Standard ist 7 Tage, für schnelleres Greifen den Zyklus verkürzen oder per Client Notification anstoßen.
+### Monatlich: Rollout starten
 
-### Monatlicher Betrieb
+```powershell
+.\Tools\Start-CMCURollout.ps1 -SiteCode P01 -ProviderMachineName cm01.contoso.local `
+    -Targets @{ 26100 = <UBR>; 26200 = <UBR> } -WhatIf
+```
 
+**Warum die Deployments jeden Monat neu angelegt werden:** Ein Required-Deployment mit abgelaufener Deadline wird nach einer Detection-Änderung sofort erzwungen. Würde man nur die Detection ändern, installierten alle Ringe gleichzeitig. Das Skript entfernt deshalb zuerst alle Deployments der Application, setzt dann die Detection und legt die Ring-Deployments mit neuen Terminen an.
+
+Termine relativ zum Patchday (zweiter Dienstag, abweichend mit `-PatchDay`). Verfügbar ab 08:00, Deadline 12:00 Clientzeit:
+
+| Ring | Verfügbar | Deadline | Installation/Neustart außerhalb Wartungsfenster |
+|---|---|---|---|
+| 0 – IT | +1 Tag | +1 Tag | ja |
+| 1 – Pilot | +2 Tage | +4 Tage | ja |
+| 2 – Breit | +7 Tage | +10 Tage | ja |
+| 3 – Kritisch | +10 Tage | +10 Tage | nein (nur im Wartungsfenster) |
+
+Den Ringplan passt du im Skript in `$rings` an. Alle Deployments: Required, Benachrichtigung *DisplayAll*, Zeitbasis Clientzeit.
+
+Ablauf pro Monat:
 1. Patchday: neue UBR aus der *Windows 11 update history* entnehmen (24H2 und 25H2 teilen sich das LCU)
-2. Auf Ring 0 testen (Skript-Log prüfen: angebotener Titel, Ergebnis `Installed`)
-3. Detection aktualisieren:
-   ```powershell
-   .\Tools\Set-CMCUDetection.ps1 -SiteCode P01 -ProviderMachineName cm01.contoso.local `
-       -ApplicationName 'Windows 11 Cumulative Update' -DeploymentTypeName 'PSADT' `
-       -Targets @{ 26100 = <UBR>; 26200 = <UBR> }
-   ```
-4. Neue Deployments/Phasen gemäß Ringplan anlegen (oder bestehende Deadlines anpassen)
+2. `Start-CMCURollout.ps1` ausführen
+3. Ring 0 prüfen (PSADT-Log: angebotener Titel, Ergebnis `Installed`, Exit 3010). Bei Problemen die Deployments von Ring 1–3 vor deren Verfügbarkeitstermin löschen.
+
+### Client Settings
+
+- Neustart-Countdown über **Computer Restart** (z. B. 8 h Countdown, 15 Min. finale Warnung)
+- Ring 3 bekommt den Dialog nur, wenn ein Benutzer angemeldet ist. Ohne Anmeldung läuft PSADT (`DeployMode Auto`) still.
 
 ## Bekannte Einschränkungen
 
